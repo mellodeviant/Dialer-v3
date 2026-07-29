@@ -482,7 +482,18 @@ function findColumn(headers, aliases){
 // than guessed at incorrectly.
 function normalizePhone(raw){
   const v = (raw || '').trim();
-  if(!v || v.startsWith('+')) return v;
+  if(!v) return v;
+  // A LEADING "+" USED TO SHORT-CIRCUIT THE WHOLE FUNCTION, separators and all. E.164 allows digits
+  // only after the "+", but every built-in sample lead is written "+1 555-0142" and real exports
+  // carry spaces, hyphens and parentheses -- so the value handed to Twilio as `To` was routinely
+  // "+1 555-0142", which its gateway rejects. The comment above describes the *missing* "+1" case,
+  // which was fixed; this is the present-but-dirty case, which was not. (F-5)
+  if(v.startsWith('+')){
+    const rest = v.slice(1).replace(/[\s().\-]/g, '');
+    // Only rewrite when what remains is purely digits. An extension ("+1 555 0142 x22"), letters,
+    // or anything else unexpected is left exactly as typed rather than silently mangled.
+    return /^\d+$/.test(rest) ? `+${rest}` : v;
+  }
   const digits = v.replace(/\D/g, '');
   if(digits.length === 10) return `+1${digits}`;
   if(digits.length === 11 && digits[0] === '1') return `+${digits}`;
@@ -579,7 +590,7 @@ function uploadLeads(file){
       if(!leads.length) throw new Error('No usable rows found (need at least a name and a phone number).');
       // Uploading a new list is a hard reset of the session, same as Stop: any in-flight call
       // or partially-worked queue against the OLD list is meaningless against the new one.
-      replaceLeadList(leads, `📄 Uploaded ${file.name} — ${leads.length} lead(s) loaded, replacing the previous list`);
+      replaceLeadList(leads, `📄 Uploaded ${esc(file.name)} — ${leads.length} lead(s) loaded, replacing the previous list`);
       $('#csvStatus').textContent =
         `Loaded ${leads.length} lead${leads.length===1?'':'s'} from ${file.name}` +
         (skipped.length ? ` — skipped ${skipped.length} row(s) missing name/phone (line ${skipped.join(', ')}).` : '.');
@@ -587,7 +598,7 @@ function uploadLeads(file){
       archiveCurrentUpload(leads, file.name);
     } catch(err){
       $('#csvStatus').textContent = `Upload failed: ${err.message}`;
-      log(`Upload failed: ${err.message}`,'bad');
+      log(`Upload failed: ${esc(err.message)}`,'bad');
     }
   };
   reader.onerror = () => {
@@ -610,10 +621,10 @@ async function archiveCurrentUpload(leads, filename){
       body: JSON.stringify({ agentIdentity: S.twilio.identity || 'unknown-agent', filename, leads }),
     });
     const data = await parseJsonResponse(resp, 'Could not save this upload to your archive');
-    log(`💾 Archived "${filename}" (${data.leadCount} leads) to ${S.twilio.identity || 'unknown-agent'}'s archive`,'ok');
+    log(`💾 Archived "${esc(filename)}" (${esc(data.leadCount)} leads) to ${esc(S.twilio.identity || 'unknown-agent')}'s archive`,'ok');
     fetchArchiveList();
   } catch(err){
-    log(`Archive save failed: ${err.message}`,'bad');
+    log(`Archive save failed: ${esc(err.message)}`,'bad');
   }
 }
 async function fetchArchiveList(){
@@ -635,12 +646,12 @@ async function fetchArchiveList(){
     }
     sel.innerHTML = data.archives.map(a=>{
       const when = new Date(a.uploadedAt).toLocaleString();
-      return `<option value="${a.id}">${a.filename} — ${a.leadCount} leads — ${when}</option>`;
+      return `<option value="${esc(a.id)}">${esc(a.filename)} — ${esc(a.leadCount)} leads — ${esc(when)}</option>`;
     }).join('');
     loadBtn.disabled = false; if(delBtn) delBtn.disabled = false;
   } catch(err){
     sel.innerHTML = `<option value="">Failed to load archive</option>`;
-    log(`Archive list failed: ${err.message}`,'bad');
+    log(`Archive list failed: ${esc(err.message)}`,'bad');
   }
 }
 async function loadArchiveEntry(){
@@ -653,11 +664,11 @@ async function loadArchiveEntry(){
       { headers: NGROK_BYPASS }
     );
     const entry = await parseJsonResponse(resp, 'Could not load this archived upload');
-    replaceLeadList(entry.leads, `📂 Loaded ${entry.leads.length} lead(s) from archive: ${entry.filename}`);
+    replaceLeadList(entry.leads, `📂 Loaded ${entry.leads.length} lead(s) from archive: ${esc(entry.filename)}`);
     $('#csvStatus').textContent =
       `Loaded ${entry.leads.length} lead(s) from your archive (${entry.filename}, saved ${new Date(entry.uploadedAt).toLocaleString()}).`;
   } catch(err){
-    log(`Failed to load archived upload: ${err.message}`,'bad');
+    log(`Failed to load archived upload: ${esc(err.message)}`,'bad');
   }
 }
 // Deletes one archived upload from the connected agent's server-side archive. This only removes it
@@ -677,10 +688,10 @@ async function deleteArchiveEntry(){
     if(!resp.ok){
       await parseJsonResponse(resp, 'Could not delete this archived upload');
     }
-    log(`🗑 Deleted "${label}" from ${S.twilio.identity}'s archive`,'ok');
+    log(`🗑 Deleted "${esc(label)}" from ${esc(S.twilio.identity)}'s archive`,'ok');
     fetchArchiveList();
   } catch(err){
-    log(`Archive delete failed: ${err.message}`,'bad');
+    log(`Archive delete failed: ${esc(err.message)}`,'bad');
   }
 }
 
@@ -783,6 +794,31 @@ const blockedSeen = () => new Set(LEADS.filter(L => L.block && (S.done[L.id] || 
 const $ = s => document.querySelector(s);
 const pad2 = n => String(n).padStart(2,'0');
 const mmss = s => `${Math.floor(s/60)}:${pad2(s%60)}`;
+/* HTML-ESCAPE EVERY UNTRUSTED VALUE THAT REACHES innerHTML. (F-4)
+ *
+ * This page renders through `innerHTML` throughout, and almost nothing it renders is its own: lead
+ * names and phones come from vendor CSVs, from the agency's public web quote form via Supabase, and
+ * -- since the lead archive landed -- from OTHER AGENTS' uploads served back by the backend.
+ * Recording labels come from `leadName` on a backend route with no signature validation, so they
+ * are attacker-supplied outright.
+ *
+ * A name of `<img src=x onerror=...>` therefore executes in a tab that holds a registered Twilio
+ * device and authenticated reach into every archived lead list. Escape at the point of
+ * interpolation; the alternative (escaping at import) leaves every future render path unprotected.
+ *
+ * `log()` deliberately still accepts HTML -- its own messages use <b> for emphasis -- so lead data
+ * is escaped at each log CALL SITE rather than inside log() itself.
+ */
+function esc(v){
+  return String(v ?? '')
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+// The shape Twilio's gateway requires for an outbound `To`: "+", country code, digits only. Shared
+// by the manual-dial validator, the queue's live-dial guard and the power-dial guard, so all three
+// paths agree on what "dialable" means -- server.js applies the identical regex in
+// complianceCheck(), and a client that disagreed with it just produced opaque 422s. (F-5)
+const E164 = /^\+[1-9]\d{7,14}$/;
 function log(msg, kind){
   const d = document.createElement('div');
   const now = new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'});
@@ -800,7 +836,7 @@ function renderQueue(){
     const rec = S.done[L.id];
     el.className = 'lead' + (i===S.idx ? ' current' : '') + (rec ? ' done' : '');
     const verdict = rec
-      ? `<span class="pill">${DISPO_LABEL[rec.dispo] || rec.dispo}</span>`
+      ? `<span class="pill">${esc(DISPO_LABEL[rec.dispo] || rec.dispo)}</span>`
       : S.deferred[L.id] ? `<span class="pill">⏳ requeued</span>`
       : L.block ? `<span class="pill bad">blocked</span>`
                 : `<span class="pill ok">eligible</span>`;
@@ -808,12 +844,12 @@ function renderQueue(){
     // blocked, not already completed. A bare spacer keeps the row aligned when there's no checkbox.
     const selectable = !L.block && !rec;
     const cb = selectable
-      ? `<input type="checkbox" class="pdCheck" data-id="${L.id}" title="Select for power dial"
+      ? `<input type="checkbox" class="pdCheck" data-id="${esc(L.id)}" title="Select for power dial"
            ${pdSelected.has(L.id)?'checked':''} style="margin-top:3px">`
       : `<span style="display:inline-block;width:13px"></span>`;
     el.innerHTML = `${cb}<div class="grow">
-        <div class="nm">${L.name}</div>
-        <div class="meta">${L.phone} · ${L.city}, ${L.state} · ${L.attempts} prior</div>
+        <div class="nm">${esc(L.name)}</div>
+        <div class="meta">${esc(L.phone)} · ${esc(L.city)}, ${esc(L.state)} · ${esc(L.attempts)} prior</div>
       </div>${verdict}`;
     q.appendChild(el);
   });
@@ -913,31 +949,31 @@ function renderStage(){
   body.innerHTML = `
     <div class="contact">
       <div class="top">
-        <h3>${L.name}</h3>
-        <span class="tel">${L.phone}</span>
-        <span class="pill ${L.block?'bad':'ok'}">${L.block ? L.block.code : 'eligible'}</span>
+        <h3>${esc(L.name)}</h3>
+        <span class="tel">${esc(L.phone)}</span>
+        <span class="pill ${L.block?'bad':'ok'}">${L.block ? esc(L.block.code) : 'eligible'}</span>
       </div>
       <div class="facts">
-        <div class="fact"><i>Age</i><b>${L.age ?? '—'}</b></div>
-        <div class="fact"><i>Location</i><b>${L.city}, ${L.state} (${L.tz})</b></div>
-        <div class="fact"><i>Product</i><b>${L.product}</b></div>
-        <div class="fact"><i>Lead source</i><b>${L.source}</b></div>
-        <div class="fact"><i>Prior attempts</i><b>${L.attempts}</b></div>
-        <div class="fact"><i>Last touch</i><b>${L.lastTouch}</b></div>
-        <div class="fact"><i>Consent on file</i><b>${L.consent}</b></div>
-        <div class="fact"><i>Record ID</i><b style="font-family:var(--mono)">${L.id}</b></div>
+        <div class="fact"><i>Age</i><b>${esc(L.age ?? '—')}</b></div>
+        <div class="fact"><i>Location</i><b>${esc(L.city)}, ${esc(L.state)} (${esc(L.tz)})</b></div>
+        <div class="fact"><i>Product</i><b>${esc(L.product)}</b></div>
+        <div class="fact"><i>Lead source</i><b>${esc(L.source)}</b></div>
+        <div class="fact"><i>Prior attempts</i><b>${esc(L.attempts)}</b></div>
+        <div class="fact"><i>Last touch</i><b>${esc(L.lastTouch)}</b></div>
+        <div class="fact"><i>Consent on file</i><b>${esc(L.consent)}</b></div>
+        <div class="fact"><i>Record ID</i><b style="font-family:var(--mono)">${esc(L.id)}</b></div>
       </div>
     </div>
     ${L.block ? `
       <div class="blocked">
         <h4>⛔ This call was not placed</h4>
-        <p>${L.block.msg}</p>
+        <p>${esc(L.block.msg)}</p>
         <p style="margin-top:8px"><b>What happens next:</b> ${
           (BLOCKED_ACTIONS[L.block.code] && BLOCKED_ACTIONS[L.block.code].temporary)
             ? 'This block is <b>temporary</b>. Requeue the lead — do not retire it.'
             : 'This block is <b>not</b> time-limited. Confirm it below; do not place a call.'
         }</p>
-        <p style="margin-top:8px"><code>decision=DENY  rule=${L.block.code}  logged=immutable</code></p>
+        <p style="margin-top:8px"><code>decision=DENY  rule=${esc(L.block.code)}  logged=immutable</code></p>
       </div>` : ''}
     <div class="callbar">
       <div class="status"><span class="dot ${dotCls}"></span>${label}</div>
@@ -1004,7 +1040,7 @@ function renderDispo(){
   });
   if(blocked && cfg){
     $('#blockedActions').innerHTML = cfg.actions.map(a =>
-      `<button data-d="${a.d}"${a.neg ? ' class="neg"' : ''}>${a.label}</button>`).join('');
+      `<button data-d="${esc(a.d)}"${a.neg ? ' class="neg"' : ''}>${esc(a.label)}</button>`).join('');
     document.querySelectorAll('#blockedActions button').forEach(b=>{
       b.classList.toggle('sel', S.dispo === b.dataset.d);
       b.onclick = ()=>{ S.dispo = b.dataset.d; renderDispo(); };
@@ -1099,8 +1135,8 @@ function renderPowerDialLegs(){
     return `<div class="lead">
         <span class="dot ${dotCls}" style="margin-top:5px"></span>
         <div class="grow">
-          <div class="nm">${L.name}</div>
-          <div class="meta">${L.phone}</div>
+          <div class="nm">${esc(L.name)}</div>
+          <div class="meta">${esc(L.phone)}</div>
         </div>
         <span class="pill ${dotCls==='live'?'ok':dotCls==='err'?'bad':''}">${label}</span>
       </div>`;
@@ -1143,7 +1179,7 @@ function recordLegOutcome(leg){
     dispo = 'not-attempted';
     note = '⚠ ABANDONED CALL — this consumer answered but was disconnected because another line answered first.';
     S.stats.abandoned++;
-    log(`⚠ ABANDONED CALL recorded — ${other.name} answered and was disconnected (power dial race)`,'bad');
+    log(`⚠ ABANDONED CALL recorded — ${esc(other.name)} answered and was disconnected (power dial race)`,'bad');
   } else if(leg.hungUpReason === 'lost-race'){
     dispo = 'no-answer'; note = 'Power dial: still ringing when another line answered first.';
   } else {
@@ -1201,7 +1237,7 @@ function connectPowerDialWinner(){
   S.stats.contact++;
   startTick();
   const L = LEADS[S.idx];
-  log(`📞 Power dial connected — ${L.name} (${L.phone}) answered first of ${PD.legs.length}`,'ok');
+  log(`📞 Power dial connected — ${esc(L.name)} (${esc(L.phone)}) answered first of ${PD.legs.length}`,'ok');
   render();
 }
 // Cleans up a session that never produced a winner (agent aborted, or the agent's own leg dropped
@@ -1247,7 +1283,7 @@ function startPowerDialSimulated(leadIdxs){
       leg.timer = null;
       if(leg.plannedOutcome === 'machine'){
         leg.answeredBy = 'machine_end_beep'; leg.status = 'completed'; leg.hungUpReason = 'machine-detected';
-        log(`${LEADS[leg.leadIndex].name}: voicemail detected (simulated), line released`);
+        log(`${esc(LEADS[leg.leadIndex].name)}: voicemail detected (simulated), line released`);
         recordLegOutcome(leg);
         render(); maybeEndUnanswered();
         return;
@@ -1267,7 +1303,7 @@ function startPowerDialSimulated(leadIdxs){
         return;
       }
       leg.status = 'completed';
-      log(`${LEADS[leg.leadIndex].name}: no answer (simulated)`);
+      log(`${esc(LEADS[leg.leadIndex].name)}: no answer (simulated)`);
       recordLegOutcome(leg);
       render(); maybeEndUnanswered();
     }, delay);
@@ -1275,6 +1311,16 @@ function startPowerDialSimulated(leadIdxs){
 }
 async function startPowerDialLive(leadIdxs){
   const numbers = leadIdxs.map(i => LEADS[i].phone);
+  // server.js's /power-dial/start rejects the WHOLE batch with a 422 if any single number fails its
+  // E.164 check, so one dirty row out of a CSV silently kills a five-line dial. Name the offenders
+  // here instead. (F-5)
+  const bad = leadIdxs.filter(i => !E164.test(LEADS[i].phone));
+  if(bad.length){
+    throw new Error(
+      `${bad.length} selected lead(s) have numbers Twilio cannot dial: ` +
+      bad.map(i => `${LEADS[i].name} (${LEADS[i].phone})`).join(', ')
+    );
+  }
   const url = S.twilio.backendUrl;
   const resp = await fetch(`${url}/power-dial/start`, {
     method:'POST', headers:{'Content-Type':'application/json', ...NGROK_BYPASS},
@@ -1304,7 +1350,7 @@ async function startPowerDialLive(leadIdxs){
   call.on('disconnect', ended('disconnect'));
   call.on('cancel', ended('cancel'));
   call.on('reject', ended('reject'));
-  call.on('error', (err) => { log(`Power dial agent leg error: ${err.message}`,'bad'); ended('error')(); });
+  call.on('error', (err) => { log(`Power dial agent leg error: ${esc(err.message)}`,'bad'); ended('error')(); });
   pollPowerDialStatus();
 }
 /* POLLING CONTINUES PAST THE WINNER. It used to stop the moment a line connected, and every other
@@ -1342,7 +1388,7 @@ function pollPowerDialStatus(){
       renderStage();
     } catch(e){
       // Surface it, but only once per session -- a flaky network shouldn't spam the log every second.
-      if(PD && !PD.loggedPollError){ PD.loggedPollError = true; log(`Power dial status check error: ${e.message}`,'bad'); }
+      if(PD && !PD.loggedPollError){ PD.loggedPollError = true; log(`Power dial status check error: ${esc(e.message)}`,'bad'); }
     }
   }, 1000);
   PD.pollTimer = timer;
@@ -1362,13 +1408,13 @@ function startManualDial(){
   if(PD && !PD.finished){ log('A power dial is still ringing — finish that first','bad'); return; }
   const raw = $('#manualNumber').value.trim();
   const number = normalizePhone(raw);
-  if(!/^\+[1-9]\d{7,14}$/.test(number)){
-    log(`Manual dial refused — "${raw}" doesn't look like a valid phone number`,'bad');
+  if(!E164.test(number)){
+    log(`Manual dial refused — "${esc(raw)}" doesn't look like a valid phone number`,'bad');
     return;
   }
   MD = { number, phase:'dialing' };
   S.elapsed = 0; S.muted = false; S.keypad = false; S.dtmf = '';
-  log(`📞 Manual dial — calling ${number}…`, S.twilio.liveEnabled ? 'bad' : undefined);
+  log(`📞 Manual dial — calling ${esc(number)}…`, S.twilio.liveEnabled ? 'bad' : undefined);
   render();
 
   // LIVE PATH -- same two gates (registered device + liveEnabled) as every other dial path here.
@@ -1390,9 +1436,9 @@ function startManualDial(){
       call.on('disconnect', ended('disconnect'));
       call.on('cancel', ended('cancel'));
       call.on('reject', ended('reject'));
-      call.on('error', (err) => { log(`Manual call error: ${err.message}`,'bad'); ended('error')(); });
+      call.on('error', (err) => { log(`Manual call error: ${esc(err.message)}`,'bad'); ended('error')(); });
     }).catch(err => {
-      log(`Manual dial connect failed: ${err.message}`,'bad');
+      log(`Manual dial connect failed: ${esc(err.message)}`,'bad');
       if(MD) MD.phase = 'wrapup';
       render();
     });
@@ -1434,7 +1480,7 @@ function hangUpManual(){
 function closeManualDial(){
   if(!MD) return;
   const note = $('#manualNotes') ? $('#manualNotes').value.trim() : '';
-  log(`Manual dial closed — ${MD.number}` + (note ? ` · note: ${note}` : ' · no note'));
+  log(`Manual dial closed — ${esc(MD.number)}` + (note ? ` · note: ${note}` : ' · no note'));
   MD = null;
   $('#manualNumber').value = '';
   render();
@@ -1447,7 +1493,7 @@ function renderManualDial(){
     <div class="contact">
       <div class="top">
         <h3>Manual dial</h3>
-        <span class="tel">${MD.number}</span>
+        <span class="tel">${esc(MD.number)}</span>
         <span class="pill">not from lead queue</span>
       </div>
     </div>
@@ -1510,23 +1556,33 @@ function loadLead(i){
   if(L.block){
     // No counter increment here. See blockedSeen(). (P-9)
     S.phase='blocked';
-    log(`⛔ ${L.name} — <b>${L.block.code}</b>, call not placed`,'bad');
+    log(`⛔ ${esc(L.name)} — <b>${esc(L.block.code)}</b>, call not placed`,'bad');
   } else {
     S.phase='ready';
-    log(`Loaded ${L.name} (${L.phone})`);
+    log(`Loaded ${esc(L.name)} (${esc(L.phone)})`);
   }
   render();
 }
 function startDial(){
   if(S.phase!=='ready') return;
-  S.phase='dialing'; S.stats.dialed++; S.attempted=true;
   const L = LEADS[S.idx];
+  // E.164 GUARD, LIVE PATH ONLY. Manual dial has validated its input since the day it was written;
+  // the queue path never did, so a malformed number out of a CSV went straight to Twilio and came
+  // back as an opaque gateway rejection with no indication of which lead or why. Checked BEFORE any
+  // state is mutated, so a refusal doesn't leave a phantom dial in the statistics. Simulated dialing
+  // stays permissive on purpose -- the prototype has to keep demoing with fictional numbers. (F-5)
+  if(S.twilio.liveEnabled && S.twilio.device && !E164.test(L.phone)){
+    log(`Refused to dial ${esc(L.name)} — "${esc(L.phone)}" is not a valid phone number for Twilio ` +
+        `(needs "+", country code, then digits only)`,'bad');
+    return;
+  }
+  S.phase='dialing'; S.stats.dialed++; S.attempted=true;
 
   // LIVE PATH. Both gates (a registered Twilio.Device AND the explicit "Enable live calling"
   // checkbox) have to be open for this branch to run at all -- see twilioConnect() and the
   // liveModeCheck handler below. Anything short of that falls through to the simulated branch.
   if(S.twilio.liveEnabled && S.twilio.device){
-    log(`⚠ LIVE — dialing ${L.phone} for real via Twilio…`,'bad');
+    log(`⚠ LIVE — dialing ${esc(L.phone)} for real via Twilio…`,'bad');
     render();
     S.twilio.device.connect({ params: { To: L.phone, LeadId: L.id, LeadName: L.name } }).then(call => {
       if(S.idx < 0 || LEADS[S.idx] !== L) { call.disconnect(); return; } // lead changed underneath us
@@ -1544,9 +1600,9 @@ function startDial(){
       call.on('disconnect', ended('disconnect'));
       call.on('cancel', ended('cancel'));
       call.on('reject', ended('reject'));
-      call.on('error', (err) => { log(`Twilio call error: ${err.message}`,'bad'); ended('error')(); });
+      call.on('error', (err) => { log(`Twilio call error: ${esc(err.message)}`,'bad'); ended('error')(); });
     }).catch(err => {
-      log(`Twilio connect failed: ${err.message}`,'bad');
+      log(`Twilio connect failed: ${esc(err.message)}`,'bad');
       S.phase='wrapup'; S.dispo='no-answer';
       render();
     });
@@ -1555,7 +1611,7 @@ function startDial(){
 
   // SIMULATED PATH (default). Simulated ring, then a simulated answer-or-not. Nothing leaves the
   // browser -- this is unchanged from the original prototype behavior.
-  log(`Dialing ${L.phone}…`);
+  log(`Dialing ${esc(L.phone)}…`);
   render();
   setTimeout(()=>{
     if(S.phase!=='dialing') return;
@@ -1627,7 +1683,7 @@ function finish(dispo, skipped){
   // LAST-LINE GUARD. Even if a future edit re-arms a call outcome on a blocked lead, the record is
   // refused here. The panel is the affordance; this is the invariant. (P-7)
   if(L.block && IMPLIES_CALL.has(dispo)){
-    log(`Refused: "${DISPO_LABEL[dispo]}" asserts a call was placed, and ${L.block.code} blocked this lead`,'bad');
+    log(`Refused: "${DISPO_LABEL[dispo]}" asserts a call was placed, and ${esc(L.block.code)} blocked this lead`,'bad');
     return;
   }
   if(!S.attempted && dispo==='no-answer'){
@@ -1647,7 +1703,7 @@ function finish(dispo, skipped){
   // DEFER is a requeue, not a disposition: no record in S.done, so the lead stays eligible. (P-6)
   if(dispo==='defer'){
     S.deferred[L.id] = { reason: (L.block ? L.block.code : 'agent-deferred'), at: new Date().toISOString() };
-    log(`⏳ ${L.name} requeued — <b>${L.block ? L.block.code : 'deferred'}</b>, not retired`);
+    log(`⏳ ${esc(L.name)} requeued — <b>${esc(L.block ? L.block.code : 'deferred')}</b>, not retired`);
     advance();
     return;
   }
@@ -1670,17 +1726,17 @@ function finish(dispo, skipped){
   };
   S.done[L.id] = rec;
   if(dispo==='appointment') S.stats.appt++;
-  log(`${skipped?'Skipped':'Disposition'}: <b>${rec.label}</b> — ${L.name}` +
+  log(`${skipped?'Skipped':'Disposition'}: <b>${esc(rec.label)}</b> — ${esc(L.name)}` +
       (note ? ` · note stored (${note.length} chars)` : ' · no note'),
       dispo==='appointment' ? 'ok' : undefined);
   if(rec.callbackAt)
     log(`Callback scheduled for ${new Date(rec.callbackAt).toLocaleString()}`);
   if(dispo==='dnc')
-    log(`${L.name} added to internal DNC — all future campaigns will block`,'bad');
+    log(`${esc(L.name)} added to internal DNC — all future campaigns will block`,'bad');
   // A retired compliance block gets its OWN audit line, visibly different from an ordinary skip. (P-8)
   if(rec.complianceAck)
-    log(`🔐 COMPLIANCE: ${L.block ? L.block.code : '—'} acknowledged for ${L.name}` +
-        (rec.complianceReason ? ` — "${rec.complianceReason}"` : ''), 'bad');
+    log(`🔐 COMPLIANCE: ${esc(L.block ? L.block.code : '—')} acknowledged for ${esc(L.name)}` +
+        (rec.complianceReason ? ` — "${esc(rec.complianceReason)}"` : ''), 'bad');
   if(rec.interrupted)
     log(`Recorded as interrupted by ${rec.interrupted} after ${mmss(rec.talkSeconds)}`,'bad');
   // The power-dial session this lead came from (if any) is done once its disposition is saved --
@@ -1779,7 +1835,7 @@ function recordInterruption(kind){
     blockCode:null, complianceAck:false, complianceReason:null,
     skipped:false, agent: S.twilio.identity || null, at:new Date().toISOString()
   };
-  log(`⚠ In-flight call to ${L.name} cut by ${kind} after ${mmss(S.elapsed)} — recorded as interrupted`,'bad');
+  log(`⚠ In-flight call to ${esc(L.name)} cut by ${kind} after ${mmss(S.elapsed)} — recorded as interrupted`,'bad');
 }
 $('#stopBtn').onclick = ()=>{
   // Talk time already spent is talk time. Only hangUp() used to accrue it, so stopping (or killing)
@@ -1800,7 +1856,7 @@ $('#powerDialBtn').onclick = async ()=>{
   pdSelected.clear();
   if(S.twilio.liveEnabled && S.twilio.device){
     try{ await startPowerDialLive(leadIdxs); }
-    catch(err){ log(`Power dial failed to start: ${err.message}`,'bad'); PD=null; render(); }
+    catch(err){ log(`Power dial failed to start: ${esc(err.message)}`,'bad'); PD=null; render(); }
   } else {
     startPowerDialSimulated(leadIdxs);
   }
@@ -1929,7 +1985,7 @@ async function twilioConnect(){
     });
     device.on('error', (err) => {
       setTwilioStatus(`Twilio device error: ${err.message}`, 'bad');
-      log(`Twilio device error: ${err.message}`, 'bad');
+      log(`Twilio device error: ${esc(err.message)}`, 'bad');
     });
     device.on('unregistered', () => {
       setTwilioStatus('Disconnected from Twilio — dialing is simulated.', 'bad');
@@ -1960,7 +2016,7 @@ async function twilioConnect(){
     const msg = (err && err.message) ? err.message
       : (typeof err === 'string' ? err : 'Connection failed (no further detail from the SDK — check the browser console and your network/firewall).');
     setTwilioStatus(`Connection failed: ${msg}`, 'bad');
-    log(`Twilio connect failed: ${msg}`, 'bad');
+    log(`Twilio connect failed: ${esc(msg)}`, 'bad');
   } finally {
     $('#twilioConnectBtn').disabled = false;
   }
@@ -1999,13 +2055,13 @@ async function fetchRecordings(){
       const dur = r.duration ? mmss(r.duration) : '—';
       const audioUrl = `${S.twilio.backendUrl}/recordings/${encodeURIComponent(r.sid)}/audio`;
       return `<div style="padding:9px 14px;border-bottom:1px solid #1e2531">
-        <div style="font-size:12px;font-weight:600">${who}</div>
-        <div style="font-size:11px;color:var(--ink-faint);margin:2px 0 6px">${when} · ${dur}</div>
-        <audio controls preload="none" style="width:100%;height:30px" src="${audioUrl}"></audio>
+        <div style="font-size:12px;font-weight:600">${esc(who)}</div>
+        <div style="font-size:11px;color:var(--ink-faint);margin:2px 0 6px">${esc(when)} · ${esc(dur)}</div>
+        <audio controls preload="none" style="width:100%;height:30px" src="${esc(audioUrl)}"></audio>
       </div>`;
     }).join('');
   } catch(err){
-    listEl.innerHTML = `<div style="padding:10px 14px;color:var(--bad);font-size:11.5px">${err.message}</div>`;
+    listEl.innerHTML = `<div style="padding:10px 14px;color:var(--bad);font-size:11.5px">${esc(err.message)}</div>`;
   }
 }
 $('#recordingsRefreshBtn').onclick = fetchRecordings;
