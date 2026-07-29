@@ -1120,42 +1120,88 @@ function renderPowerDialLegs(){
     if(S.twilio.call){ S.twilio.call.disconnect(); } else endPowerDial('agent-aborted');
   };
 }
+// How close a losing line's answer has to land to the winner's for the consumer to have genuinely
+// picked up before the hangup reached them. Inside this window the call was ANSWERED AND DROPPED --
+// an abandoned call under the FCC/FTC predictive-dialing rules. Outside it, the line is released
+// while still ringing and nobody was ever disturbed.
+const ABANDON_WINDOW_MS = 500;
+// True while a leg could still change state on its own.
+const legActive = (leg) => leg.status === 'queued' || leg.status === 'ringing';
+// Writes the disposition record for ONE non-winning leg, from that leg's own final state, exactly
+// once. Called as each leg reaches a terminal state -- never as a batch at winner-time, because a
+// leg's fate is not yet known then: a consumer can answer a fraction of a second after another
+// line won, and that is precisely the case the abandoned-call statistic exists to count. (F-3)
+function recordLegOutcome(leg){
+  if(leg.recorded) return;
+  leg.recorded = true;
+  const other = LEADS[leg.leadIndex];
+  if(!other) return;
+  let dispo, note;
+  if(leg.answeredBy && leg.answeredBy.startsWith('machine')){
+    dispo = 'voicemail'; note = 'Power dial: reached voicemail; call released automatically, nothing left.';
+  } else if(leg.hungUpReason === 'abandoned-lost-race'){
+    dispo = 'not-attempted';
+    note = '⚠ ABANDONED CALL — this consumer answered but was disconnected because another line answered first.';
+    S.stats.abandoned++;
+    log(`⚠ ABANDONED CALL recorded — ${other.name} answered and was disconnected (power dial race)`,'bad');
+  } else if(leg.hungUpReason === 'lost-race'){
+    dispo = 'no-answer'; note = 'Power dial: still ringing when another line answered first.';
+  } else {
+    dispo = 'no-answer'; note = 'Power dial: rang out with no answer.';
+  }
+  S.done[other.id] = {
+    dispo, label: DISPO_LABEL[dispo] || dispo, note, callbackAt:null,
+    attempted:true, talkSeconds:0, interrupted:null, blockCode:null,
+    complianceAck:false, complianceReason:null, skipped:false,
+    agent: S.twilio.identity || null,
+    at:new Date().toISOString(), powerDialSession: PD ? PD.id : null,
+  };
+}
+// Hangs up the other lines the instant a winner is chosen. A line that was ABOUT to be answered --
+// within ABANDON_WINDOW_MS -- is deliberately left to run, because in reality the consumer's pickup
+// and the hangup cross in flight and they answer to dead air. Clearing every timer unconditionally
+// is what made the abandoned-call branch unreachable. (F-3)
+function releaseLosingLegs(winner){
+  const now = Date.now();
+  PD.legs.forEach(o=>{
+    if(o === winner || !legActive(o)) return;
+    if(o.plannedOutcome === 'human' && (o.dueAt - now) <= ABANDON_WINDOW_MS) return; // let it land
+    if(o.timer){ clearTimeout(o.timer); o.timer = null; }
+    o.status = 'completed'; o.hungUpReason = 'lost-race';
+    recordLegOutcome(o);
+  });
+}
+// Ends a power dial in which no line was ever answered. Without this the session object stayed
+// non-null with finished:false forever: the stage kept drawing "Power dial in progress" over dead
+// legs, the Power dial button stayed disabled, and so did Start session. (F-2)
+function maybeEndUnanswered(){
+  if(!PD || PD.finished || PD.winnerLeadIndex != null) return;
+  if(PD.legs.some(legActive)) return;
+  PD.legs.forEach(recordLegOutcome);
+  endPowerDial('no answer on any line');
+}
 // Fires once, regardless of simulated/live, the instant a winner is chosen. From here on this
 // behaves EXACTLY like a normal connected call -- same timer, same mute/hold/keypad, same
 // disposition panel -- the only difference is which lead ended up in S.idx.
 function connectPowerDialWinner(){
   PD.finished = true;
+  PD.winnerAt = Date.now();
   S.idx = PD.winnerLeadIndex;
+  // A CONNECTED POWER-DIAL CALL IS A RUNNING SESSION. Power dial does not require pressing "Start
+  // session" first, and this used to leave S.running false -- so renderStage()'s `!S.running` guard
+  // drew the idle "No session running" card straight over a live call, leaving the agent no Hang up
+  // button, no timer and no disposition panel. On a real call that is a consumer the agent cannot
+  // hang up on. (F-1)
+  S.running = true; S.paused = false;
+  if(!S.sessionStartedAt) S.sessionStartedAt = new Date().toISOString();
   S.dispo = null; S.muted = false; S.keypad = false; S.dtmf = '';
   S.elapsed = 0; S.attempted = true; S.interrupted = null;
   $('#notes').value = ''; $('#cbTime').value = '';
   S.phase = 'connected';
-  S.stats.dialed += PD.legs.length; // every leg was a genuine dial attempt, not just the winner
   S.stats.contact++;
   startTick();
   const L = LEADS[S.idx];
   log(`📞 Power dial connected — ${L.name} (${L.phone}) answered first of ${PD.legs.length}`,'ok');
-  PD.legs.forEach(leg=>{
-    if(leg.leadIndex === PD.winnerLeadIndex) return;
-    const other = LEADS[leg.leadIndex];
-    let dispo, note;
-    if(leg.answeredBy && leg.answeredBy.startsWith('machine')){
-      dispo = 'voicemail'; note = 'Power dial: reached voicemail; call released automatically, nothing left.';
-    } else if(leg.hungUpReason === 'abandoned-lost-race'){
-      dispo = 'not-attempted';
-      note = '⚠ ABANDONED CALL — this consumer answered but was disconnected because another line answered first.';
-      S.stats.abandoned++;
-      log(`⚠ ABANDONED CALL recorded — ${other.name} answered and was disconnected (power dial race)`,'bad');
-    } else {
-      dispo = 'no-answer'; note = 'Power dial: still ringing when another line answered first.';
-    }
-    S.done[other.id] = {
-      dispo, label: DISPO_LABEL[dispo] || dispo, note, callbackAt:null,
-      attempted:true, talkSeconds:0, interrupted:null, blockCode:null,
-      complianceAck:false, complianceReason:null, skipped:false,
-      at:new Date().toISOString(), powerDialSession: PD.id,
-    };
-  });
   render();
 }
 // Cleans up a session that never produced a winner (agent aborted, or the agent's own leg dropped
@@ -1179,39 +1225,52 @@ function endPowerDial(reason){
 }
 function startPowerDialSimulated(leadIdxs){
   PD = {
-    id: 'sim-'+Date.now(), live:false, finished:false, winnerLeadIndex:null,
-    legs: leadIdxs.map(li=>({leadIndex:li, number:LEADS[li].phone, status:'ringing', answeredBy:null, hungUpReason:null})),
+    id: 'sim-'+Date.now(), live:false, finished:false, winnerLeadIndex:null, winnerAt:null,
+    legs: leadIdxs.map(li=>({leadIndex:li, number:LEADS[li].phone, status:'ringing',
+                             answeredBy:null, hungUpReason:null, recorded:false})),
   };
+  // Every leg is a genuine dial attempt the moment it is placed, answered or not. Counting these
+  // only on connect meant a power dial nobody picked up left no trace in the session's own
+  // "dialed" figure -- five consumers called, zero dials recorded.
+  S.stats.dialed += PD.legs.length;
   log(`📞 Power dial (simulated) — ringing ${leadIdxs.length} line(s) at once`,'ok');
   render();
   PD.legs.forEach(leg=>{
+    // The outcome is decided WHEN THE LEG IS PLACED, not when its timer fires, so that choosing a
+    // winner can tell which of the other lines was already about to be answered. (F-3)
+    const delay = 1200 + Math.random()*3200;
+    const roll = Math.random();
+    leg.plannedOutcome = roll < 0.15 ? 'machine' : roll < 0.55 ? 'human' : 'no-answer';
+    leg.dueAt = Date.now() + delay;
     leg.timer = setTimeout(()=>{
       if(!PD || PD.legs.indexOf(leg) === -1) return;
-      const roll = Math.random();
-      if(roll < 0.15){
+      leg.timer = null;
+      if(leg.plannedOutcome === 'machine'){
         leg.answeredBy = 'machine_end_beep'; leg.status = 'completed'; leg.hungUpReason = 'machine-detected';
         log(`${LEADS[leg.leadIndex].name}: voicemail detected (simulated), line released`);
-        renderStage();
+        recordLegOutcome(leg);
+        render(); maybeEndUnanswered();
         return;
       }
-      if(roll < 0.55){
+      if(leg.plannedOutcome === 'human'){
         if(PD.winnerLeadIndex == null){
           leg.status = 'connected';
-          PD.legs.forEach(o=>{
-            if(o!==leg){ if(o.timer) clearTimeout(o.timer); if(o.status==='ringing'){ o.status='completed'; o.hungUpReason='lost-race'; } }
-          });
           PD.winnerLeadIndex = leg.leadIndex;
+          releaseLosingLegs(leg);
           connectPowerDialWinner();
         } else {
+          // Picked up just as another line won: answered, then dropped. An abandoned call.
           leg.status = 'completed'; leg.hungUpReason = 'abandoned-lost-race';
-          renderStage(); // connectPowerDialWinner() will also record this leg's fate below via PD.legs
+          recordLegOutcome(leg);
+          render();
         }
         return;
       }
       leg.status = 'completed';
       log(`${LEADS[leg.leadIndex].name}: no answer (simulated)`);
-      renderStage();
-    }, 1200 + Math.random()*3200);
+      recordLegOutcome(leg);
+      render(); maybeEndUnanswered();
+    }, delay);
   });
 }
 async function startPowerDialLive(leadIdxs){
@@ -1223,9 +1282,12 @@ async function startPowerDialLive(leadIdxs){
   });
   const data = await parseJsonResponse(resp, 'Power dial failed to start');
   PD = {
-    id: data.session, live:true, finished:false, winnerLeadIndex:null,
-    legs: leadIdxs.map((li,n)=>({leadIndex:li, number:numbers[n], status:'queued', answeredBy:null, hungUpReason:null})),
+    id: data.session, live:true, finished:false, winnerLeadIndex:null, winnerAt:null,
+    legs: leadIdxs.map((li,n)=>({leadIndex:li, number:numbers[n], status:'queued',
+                                 answeredBy:null, hungUpReason:null, recorded:false})),
   };
+  // Same as the simulated path: a placed leg is a dial attempt regardless of how it ends.
+  S.stats.dialed += PD.legs.length;
   render();
   log(`⚠ LIVE — power dialing ${numbers.length} real number(s) at once via Twilio…`,'bad');
   const call = await S.twilio.device.connect({ params: { Conference: data.session } });
@@ -1245,33 +1307,45 @@ async function startPowerDialLive(leadIdxs){
   call.on('error', (err) => { log(`Power dial agent leg error: ${err.message}`,'bad'); ended('error')(); });
   pollPowerDialStatus();
 }
+/* POLLING CONTINUES PAST THE WINNER. It used to stop the moment a line connected, and every other
+ * leg's outcome was written in one batch from whatever the last poll happened to have said. A
+ * consumer who answered in that same second was therefore filed as "no answer" -- so the abandoned
+ * call, the one number the FCC/FTC rules actually care about, was the one this could not see.
+ * Now each leg is recorded as IT reaches a terminal state, and the poll runs until every leg has.
+ * (F-2, F-3) */
 function pollPowerDialStatus(){
   if(!PD || !PD.live) return;
-  PD.pollTimer = setInterval(async ()=>{
-    if(!PD || !PD.live || PD.finished){ if(PD && PD.pollTimer){ clearInterval(PD.pollTimer); PD.pollTimer=null; } return; }
+  const timer = setInterval(async ()=>{
+    if(!PD || !PD.live){ clearInterval(timer); return; }
     try{
       const resp = await fetch(`${S.twilio.backendUrl}/power-dial/status?session=${PD.id}`, { headers: NGROK_BYPASS });
       if(!resp.ok) return; // transient — try again next tick
       const data = await parseJsonResponse(resp, 'Power dial status check failed');
       data.legs.forEach((l,n)=>{
-        if(!PD.legs[n]) return;
-        PD.legs[n].status = l.status; PD.legs[n].answeredBy = l.answeredBy; PD.legs[n].hungUpReason = l.hungUpReason;
+        const leg = PD.legs[n];
+        if(!leg) return;
+        leg.status = l.status; leg.answeredBy = l.answeredBy; leg.hungUpReason = l.hungUpReason;
+        if(leg.leadIndex !== PD.winnerLeadIndex && !legActive(leg)) recordLegOutcome(leg);
       });
       if(PD.winnerLeadIndex == null){
         const winnerIdx = data.legs.findIndex(l => l.status === 'connected');
         if(winnerIdx !== -1){
-          clearInterval(PD.pollTimer); PD.pollTimer = null;
           PD.winnerLeadIndex = PD.legs[winnerIdx].leadIndex;
           connectPowerDialWinner();
-          return;
+          return; // keep polling — the losing legs are still resolving
         }
+        maybeEndUnanswered();
+      } else if(!PD.legs.some(legActive)){
+        // Winner connected and every other line has settled. Nothing left to watch.
+        clearInterval(timer); if(PD) PD.pollTimer = null;
       }
       renderStage();
     } catch(e){
       // Surface it, but only once per session -- a flaky network shouldn't spam the log every second.
-      if(!PD.loggedPollError){ PD.loggedPollError = true; log(`Power dial status check error: ${e.message}`,'bad'); }
+      if(PD && !PD.loggedPollError){ PD.loggedPollError = true; log(`Power dial status check error: ${e.message}`,'bad'); }
     }
   }, 1000);
+  PD.pollTimer = timer;
 }
 
 /* ================= MANUAL DIAL ================= *
