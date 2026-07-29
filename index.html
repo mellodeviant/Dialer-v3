@@ -249,6 +249,16 @@
             and enforce nothing once this is on; that has to live in your backend's <code>/voice</code>
             handler.</label>
         </div>
+        <!-- RECORDING. Owner decision 2026-07-29: recording is ON and stored by default. A single
+             solo call can be turned off here; POWER DIAL IS ALWAYS RECORDED and this control cannot
+             change that -- see startPowerDialLive(), which never sends a recording flag, and
+             server.js's /voice conference branch, which sets record-from-start unconditionally. -->
+        <div class="live-check">
+          <input type="checkbox" id="recordSoloCheck" checked>
+          <label for="recordSoloCheck">Record solo calls — on by default. Untick to place the
+            <b>next single call</b> without recording it. <b>Power dial is always recorded</b>
+            regardless of this setting.</label>
+        </div>
       </div>
 
       <!-- MANUAL DIAL. Completely independent of the lead queue/session state -- see the MD object
@@ -354,16 +364,36 @@
     </div>
     <h2 style="border-top:1px solid var(--line)">Session log</h2>
     <div class="log" id="log"></div>
-    <!-- RECORDINGS. Populated on demand (Refresh), not polled -- a recording isn't ready until
-         Twilio finishes processing it after the call ends, so there's nothing to gain from hammering
-         the endpoint continuously. Playback streams through the backend's audio proxy, which is the
-         only thing allowed to hold Twilio credentials (see server.js). -->
-    <h2 style="border-top:1px solid var(--line)">Recordings
-      <span class="count"><button class="btn" id="recordingsRefreshBtn" style="padding:3px 9px;font-size:10.5px">Refresh</button></span>
+    <!-- CALL HISTORY. Every call this session produced, newest first, with playback where a
+         recording exists. Built by merging three sources (see callHistory() in the script): the
+         session's own outcome records, manual dials, and recording metadata from the backend.
+         Recordings are fetched on demand (Refresh), not polled -- one isn't ready until Twilio
+         finishes processing it after the call ends. Playback streams through the backend's audio
+         proxy, the only thing allowed to hold Twilio credentials (see server.js).
+
+         SCOPE LIMIT, stated plainly: this is THIS BROWSER SESSION plus whatever the backend still
+         holds in memory. Durable history across restarts needs the `call_logs` table from the SaaS
+         brief -- see analysis/SAAS-AUTH-BRIEF-ANALYSIS.md. The filters and layout here are built to
+         run unchanged against that table once it exists. -->
+    <h2 style="border-top:1px solid var(--line)">Call history
+      <span class="count"><button class="btn" id="historyRefreshBtn" style="padding:3px 9px;font-size:10.5px">Refresh</button></span>
     </h2>
-    <div class="log" id="recordingsList" style="max-height:160px">
-      <div style="padding:10px 14px;color:var(--ink-faint);font-size:11.5px">Connect to Twilio to see recordings.</div>
+    <div style="padding:11px 15px;border-bottom:1px solid var(--line)">
+      <input type="text" id="histSearch" placeholder="Filter by client name or number…">
+      <div class="row" style="margin-top:8px">
+        <select id="histDirection" style="flex:1;min-width:110px">
+          <option value="">Calls in &amp; out</option>
+          <option value="out">Outbound only</option>
+          <option value="in">Inbound only</option>
+        </select>
+        <select id="histOutcome" style="flex:1;min-width:110px">
+          <option value="">All outcomes</option>
+        </select>
+        <button class="btn" id="histClearBtn" title="Clear all filters">Clear</button>
+      </div>
+      <p style="margin:8px 0 0;font-size:11.5px;color:var(--ink-faint)" id="histCount"></p>
     </div>
+    <div id="historyList" style="max-height:300px;overflow:auto"></div>
   </section>
 </main>
 <footer>
@@ -1074,7 +1104,7 @@ function renderDispo(){
     : last ? 'No leads remaining after this one.'
     : `Next up: ${LEADS[nxt].name} · ${LEADS[nxt].phone}`;
 }
-const render = ()=>{ renderQueue(); renderStats(); renderStage(); renderDispo(); syncButtons(); };
+const render = ()=>{ renderQueue(); renderStats(); renderStage(); renderDispo(); syncButtons(); renderHistory(); };
 
 /* ================= POWER DIAL ================= *
  * Rings up to 5 leads at once (simulated by default, real once both live-calling gates from the
@@ -1189,7 +1219,7 @@ function recordLegOutcome(leg){
     dispo, label: DISPO_LABEL[dispo] || dispo, note, callbackAt:null,
     attempted:true, talkSeconds:0, interrupted:null, blockCode:null,
     complianceAck:false, complianceReason:null, skipped:false,
-    agent: S.twilio.identity || null,
+    agent: S.twilio.identity || null, direction:'out',
     at:new Date().toISOString(), powerDialSession: PD ? PD.id : null,
   };
 }
@@ -1310,11 +1340,12 @@ function startPowerDialSimulated(leadIdxs){
   });
 }
 async function startPowerDialLive(leadIdxs){
-  const numbers = leadIdxs.map(i => LEADS[i].phone);
+  // Normalized for the same reason as the single-dial path -- see startDial(). (F-5)
+  const numbers = leadIdxs.map(i => normalizePhone(LEADS[i].phone));
   // server.js's /power-dial/start rejects the WHOLE batch with a 422 if any single number fails its
   // E.164 check, so one dirty row out of a CSV silently kills a five-line dial. Name the offenders
   // here instead. (F-5)
-  const bad = leadIdxs.filter(i => !E164.test(LEADS[i].phone));
+  const bad = leadIdxs.filter((li,n) => !E164.test(numbers[n]));
   if(bad.length){
     throw new Error(
       `${bad.length} selected lead(s) have numbers Twilio cannot dial: ` +
@@ -1412,7 +1443,7 @@ function startManualDial(){
     log(`Manual dial refused — "${esc(raw)}" doesn't look like a valid phone number`,'bad');
     return;
   }
-  MD = { number, phase:'dialing' };
+  MD = { number, phase:'dialing', startedAt:new Date().toISOString(), everConnected:false, talkSeconds:0 };
   S.elapsed = 0; S.muted = false; S.keypad = false; S.dtmf = '';
   log(`📞 Manual dial — calling ${esc(number)}…`, S.twilio.liveEnabled ? 'bad' : undefined);
   render();
@@ -1424,7 +1455,7 @@ function startManualDial(){
       S.twilio.call = call;
       call.on('accept', () => {
         if(!MD) return;
-        MD.phase = 'connected';
+        MD.phase = 'connected'; MD.everConnected = true;
         startTick();
         log('Manual call accepted — media connected','ok');
         render();
@@ -1449,7 +1480,7 @@ function startManualDial(){
   setTimeout(()=>{
     if(!MD || MD.phase !== 'dialing') return;
     if(Math.random() < 0.62){
-      MD.phase = 'connected';
+      MD.phase = 'connected'; MD.everConnected = true;
       startTick();
       log('Manual call answered — media connected','ok');
     } else {
@@ -1462,7 +1493,7 @@ function startManualDial(){
 function manualCallEnded(reason){
   const wasConnected = MD && MD.phase === 'connected';
   stopTick();
-  if(wasConnected) S.talkTotal += S.elapsed;
+  if(wasConnected){ S.talkTotal += S.elapsed; MD.talkSeconds = S.elapsed; }
   S.twilio.call = null;
   log(`Manual call ended (${reason}) after ${mmss(S.elapsed)}`, wasConnected ? undefined : 'bad');
   if(MD) MD.phase = 'wrapup';
@@ -1473,6 +1504,7 @@ function hangUpManual(){
   if(S.twilio.call){ S.twilio.call.disconnect(); return; }
   stopTick();
   S.talkTotal += S.elapsed;
+  MD.talkSeconds = S.elapsed;
   log(`Manual call ended after ${mmss(S.elapsed)}`);
   MD.phase = 'wrapup';
   render();
@@ -1480,7 +1512,19 @@ function hangUpManual(){
 function closeManualDial(){
   if(!MD) return;
   const note = $('#manualNotes') ? $('#manualNotes').value.trim() : '';
-  log(`Manual dial closed — ${esc(MD.number)}` + (note ? ` · note: ${note}` : ' · no note'));
+  // A MANUAL DIAL NOW LEAVES A RECORD. It has no lead id, so it cannot live in S.done -- before
+  // this the note was read, logged, and dropped, which is the one place in this file where an
+  // outcome was not preserved. It is also what made manual calls invisible to call history. (F-7)
+  MANUAL_CALLS.push({
+    number: MD.number,
+    direction: 'out',
+    outcome: MD.everConnected ? 'Manual call — connected' : 'Manual call — no answer',
+    note: note || null,
+    talkSeconds: MD.talkSeconds || 0,
+    agent: S.twilio.identity || null,
+    at: MD.startedAt || new Date().toISOString(),
+  });
+  log(`Manual dial closed — ${esc(MD.number)}` + (note ? ` · note: ${esc(note)}` : ' · no note'));
   MD = null;
   $('#manualNumber').value = '';
   render();
@@ -1566,12 +1610,17 @@ function loadLead(i){
 function startDial(){
   if(S.phase!=='ready') return;
   const L = LEADS[S.idx];
+  // NORMALIZE AT DIAL TIME, not only at import. Only CSV-imported leads pass through
+  // normalizePhone(); the built-in sample leads (and anything that sets a lead object directly)
+  // still carry display formatting like "+1 555-0142", and that is what used to be handed to Twilio
+  // verbatim. Normalizing here means the E.164 fix covers every dial, whatever the lead's origin.
+  const to = normalizePhone(L.phone);
   // E.164 GUARD, LIVE PATH ONLY. Manual dial has validated its input since the day it was written;
   // the queue path never did, so a malformed number out of a CSV went straight to Twilio and came
   // back as an opaque gateway rejection with no indication of which lead or why. Checked BEFORE any
   // state is mutated, so a refusal doesn't leave a phantom dial in the statistics. Simulated dialing
   // stays permissive on purpose -- the prototype has to keep demoing with fictional numbers. (F-5)
-  if(S.twilio.liveEnabled && S.twilio.device && !E164.test(L.phone)){
+  if(S.twilio.liveEnabled && S.twilio.device && !E164.test(to)){
     log(`Refused to dial ${esc(L.name)} — "${esc(L.phone)}" is not a valid phone number for Twilio ` +
         `(needs "+", country code, then digits only)`,'bad');
     return;
@@ -1584,7 +1633,14 @@ function startDial(){
   if(S.twilio.liveEnabled && S.twilio.device){
     log(`⚠ LIVE — dialing ${esc(L.phone)} for real via Twilio…`,'bad');
     render();
-    S.twilio.device.connect({ params: { To: L.phone, LeadId: L.id, LeadName: L.name } }).then(call => {
+    // Record flag rides along as a custom param. server.js's /voice reads it for the single-call
+    // branch only -- the power-dial conference branch sets record-from-start unconditionally, so
+    // this control genuinely cannot switch off power-dial recording. Owner decision 2026-07-29.
+    const recordSolo = !$('#recordSoloCheck') || $('#recordSoloCheck').checked;
+    if(!recordSolo) log('⚠ This call will NOT be recorded (solo recording is switched off)','bad');
+    S.twilio.device.connect({ params: {
+      To: to, LeadId: L.id, LeadName: L.name, Record: recordSolo ? 'true' : 'false'
+    } }).then(call => {
       if(S.idx < 0 || LEADS[S.idx] !== L) { call.disconnect(); return; } // lead changed underneath us
       S.twilio.call = call;
       call.on('accept', () => {
@@ -1722,6 +1778,9 @@ function finish(dispo, skipped){
                      : (dispo==='dnc-confirmed' && L.block) ? L.block.msg : null,
     skipped: !!skipped,
     agent: S.twilio.identity || null,
+    // Direction is carried on every record so the call-history filter is real rather than cosmetic.
+    // Everything is outbound today (server.js's Voice grant sets incomingAllow:false).
+    direction: 'out',
     at: new Date().toISOString()
   };
   S.done[L.id] = rec;
@@ -1833,7 +1892,7 @@ function recordInterruption(kind){
     note:($('#notes').value.trim() || null), callbackAt:null,
     attempted:true, talkSeconds:S.elapsed, interrupted:kind,
     blockCode:null, complianceAck:false, complianceReason:null,
-    skipped:false, agent: S.twilio.identity || null, at:new Date().toISOString()
+    skipped:false, agent: S.twilio.identity || null, direction:'out', at:new Date().toISOString()
   };
   log(`⚠ In-flight call to ${esc(L.name)} cut by ${kind} after ${mmss(S.elapsed)} — recorded as interrupted`,'bad');
 }
@@ -2029,42 +2088,176 @@ $('#twilioConnectBtn').onclick = twilioConnect;
   const savedName = localStorage.getItem('dialerAgentName');
   if(savedName) $('#agentName').value = savedName;
 }
-/* ---------------- Recordings ---------------- *
+/* ================= CALL HISTORY ================= *
+ * Owner request 2026-07-29: "a section where we can view+listen to all the calls made, in order of
+ * time dialed, listed by name of client and number, with additional filter features."
+ *
+ * Three sources are merged into one list, because no single one of them knows about every call:
+ *   1. S.done          -- the session's outcome records, which carry the client, the disposition,
+ *                         the note and the talk time, but nothing about a recording.
+ *   2. MANUAL_CALLS    -- manual dials. These have no lead id so they cannot live in S.done, and
+ *                         before this they left no artifact at all beyond a log line. (F-7)
+ *   3. RECORDINGS      -- backend metadata, which knows the recording SID and duration. Joined to
+ *                         the records above on `leadId`, which server.js already passes through
+ *                         /recording-status. Any recording that matches nothing still gets its own
+ *                         row -- a recording must never be silently absent from the history.
+ *
+ * SCOPE LIMIT: this is one browser session plus whatever the backend still holds in memory
+ * (server.js keeps `recordings` in a plain array that resets on restart). Durable history needs the
+ * `call_logs` table from the SaaS brief. Everything below reads from callHistory(), so pointing that
+ * one function at a real endpoint is the whole migration.
+ */
+let RECORDINGS = [];
+let MANUAL_CALLS = [];
+const histFilter = { q:'', direction:'', outcome:'' };
+
+// Every call this dialer places is outbound: the Voice grant in server.js sets `incomingAllow:false`,
+// so no inbound call can reach the agent today. The direction dimension is carried on every record
+// and the "Calls in & out" filter is real, so inbound rows will appear the moment inbound calling is
+// turned on -- but until then the "Inbound only" filter is correctly, honestly empty.
+const DIRECTION_LABEL = { out:'↗ Out', in:'↙ In' };
+
+function callHistory(){
+  const rows = [];
+  LEADS.forEach(L=>{
+    const rec = S.done[L.id];
+    if(!rec) return;
+    rows.push({
+      key:'lead:'+L.id, leadId:L.id, name:L.name, number:L.phone,
+      direction: rec.direction || 'out', at: rec.at,
+      seconds: rec.talkSeconds || 0, outcome: rec.label, dispo: rec.dispo,
+      note: rec.note, agent: rec.agent, sid: null,
+    });
+  });
+  MANUAL_CALLS.forEach((m,i)=>{
+    rows.push({
+      key:'manual:'+i, leadId:null, name:'Manual dial', number:m.number,
+      direction: m.direction || 'out', at: m.at,
+      seconds: m.talkSeconds || 0, outcome: m.outcome, dispo: null,
+      note: m.note, agent: m.agent, sid: null,
+    });
+  });
+  // Attach recordings to the call they belong to, then surface any leftovers as their own rows.
+  const claimed = new Set();
+  rows.forEach(r=>{
+    if(!r.leadId) return;
+    const rec = RECORDINGS.find(x => x.leadId && x.leadId === r.leadId && !claimed.has(x.sid));
+    if(rec){ claimed.add(rec.sid); r.sid = rec.sid; if(!r.seconds) r.seconds = rec.duration || 0; }
+  });
+  RECORDINGS.forEach(x=>{
+    if(claimed.has(x.sid)) return;
+    rows.push({
+      key:'rec:'+x.sid, leadId: x.leadId || null,
+      name: x.leadName || (x.session ? `Power dial session ${String(x.session).slice(0,8)}…` : 'Unknown'),
+      number: x.number || '—', direction:'out', at: x.createdAt,
+      seconds: x.duration || 0, outcome:'Recorded call', dispo:null,
+      note:null, agent:null, sid: x.sid,
+    });
+  });
+  rows.sort((a,b)=> new Date(b.at || 0) - new Date(a.at || 0));
+  return rows;
+}
+
+function filteredHistory(){
+  const q = histFilter.q.trim().toLowerCase();
+  const qDigits = q.replace(/\D/g,'');
+  return callHistory().filter(r=>{
+    if(histFilter.direction && r.direction !== histFilter.direction) return false;
+    if(histFilter.outcome && r.dispo !== histFilter.outcome) return false;
+    if(!q) return true;
+    // Match on name OR number. Digits-only comparison so "8135550142" finds "+1 813-555-0142" --
+    // an insurance agent pasting a number off a callback slip should not have to match formatting.
+    if(String(r.name).toLowerCase().includes(q)) return true;
+    if(String(r.number).toLowerCase().includes(q)) return true;
+    if(qDigits && String(r.number).replace(/\D/g,'').includes(qDigits)) return true;
+    return false;
+  });
+}
+
+function renderHistory(){
+  const listEl = $('#historyList'), countEl = $('#histCount');
+  if(!listEl) return;
+  const all = callHistory();
+  const rows = filteredHistory();
+  if(countEl){
+    const filtered = rows.length !== all.length;
+    countEl.textContent = all.length
+      ? `${rows.length} of ${all.length} call${all.length===1?'':'s'}${filtered ? ' (filtered)' : ''}`
+      : 'No calls yet this session.';
+  }
+  if(!rows.length){
+    listEl.innerHTML = `<div style="padding:12px 15px;color:var(--ink-faint);font-size:11.5px">${
+      all.length ? 'No calls match these filters.' : 'Calls appear here as you work the queue.'
+    }</div>`;
+    return;
+  }
+  listEl.innerHTML = rows.map(r=>{
+    const when = r.at ? new Date(r.at).toLocaleString() : '—';
+    const dur = r.seconds ? mmss(r.seconds) : '—';
+    const audio = (r.sid && S.twilio.backendUrl)
+      ? `<audio controls preload="none" style="width:100%;height:30px;margin-top:6px"
+             src="${esc(`${S.twilio.backendUrl}/recordings/${encodeURIComponent(r.sid)}/audio`)}"></audio>`
+      : '';
+    return `<div style="padding:10px 15px;border-bottom:1px solid #1e2531">
+      <div style="display:flex;gap:8px;align-items:baseline;flex-wrap:wrap">
+        <span style="font-size:12.5px;font-weight:600">${esc(r.name)}</span>
+        <button class="histNum" data-num="${esc(r.number)}"
+                style="font-family:var(--mono);font-size:11.5px;color:var(--accent);padding:0;text-decoration:underline"
+                title="Show only calls to or from this number">${esc(r.number)}</button>
+        <span class="pill" style="margin-left:auto">${esc(DIRECTION_LABEL[r.direction] || r.direction)}</span>
+      </div>
+      <div style="font-size:11px;color:var(--ink-faint);margin-top:3px">
+        ${esc(when)} · ${esc(dur)} talk${r.agent ? ` · ${esc(r.agent)}` : ''}
+      </div>
+      <div style="font-size:11.5px;margin-top:4px">${esc(r.outcome || '—')}</div>
+      ${r.note ? `<div style="font-size:11px;color:var(--ink-dim);margin-top:4px">${esc(r.note)}</div>` : ''}
+      ${audio}
+    </div>`;
+  }).join('');
+  // Clicking a number filters to that number -- the "see all the calls to or from 1 number" ask.
+  document.querySelectorAll('.histNum').forEach(b=>{
+    b.onclick = ()=>{
+      histFilter.q = b.dataset.num;
+      $('#histSearch').value = b.dataset.num;
+      renderHistory();
+    };
+  });
+}
+
+// Outcome filter options are generated from DISPO_LABEL so the two can never drift apart.
+function buildOutcomeFilter(){
+  const sel = $('#histOutcome');
+  if(!sel) return;
+  sel.innerHTML = `<option value="">All outcomes</option>` +
+    Object.entries(DISPO_LABEL).map(([k,v])=>`<option value="${esc(k)}">${esc(v)}</option>`).join('');
+}
+
+/* ---------------- Recordings fetch ---------------- *
  * Twilio records both the single-call dial (from answer) and the power-dial conference (from
  * start) -- see server.js. Fetched on demand rather than polled: a recording isn't ready until
  * Twilio finishes processing it after the call ends, so nothing is gained by hammering this.
  */
 async function fetchRecordings(){
-  const listEl = $('#recordingsList');
-  if(!listEl) return;
-  if(!S.twilio.backendUrl){
-    listEl.innerHTML = `<div style="padding:10px 14px;color:var(--ink-faint);font-size:11.5px">Connect to Twilio to see recordings.</div>`;
-    return;
-  }
-  listEl.innerHTML = `<div style="padding:10px 14px;color:var(--ink-faint);font-size:11.5px">Loading…</div>`;
+  if(!S.twilio.backendUrl){ renderHistory(); return; }
   try{
     const resp = await fetch(`${S.twilio.backendUrl}/recordings`, { headers: NGROK_BYPASS });
     const data = await parseJsonResponse(resp, 'Could not load recordings');
-    if(!data.recordings.length){
-      listEl.innerHTML = `<div style="padding:10px 14px;color:var(--ink-faint);font-size:11.5px">No recordings yet this session.</div>`;
-      return;
-    }
-    listEl.innerHTML = data.recordings.map(r=>{
-      const who = r.leadName ? r.leadName : r.session ? `Power dial session ${r.session.slice(0,8)}…` : 'Unknown';
-      const when = new Date(r.createdAt).toLocaleString();
-      const dur = r.duration ? mmss(r.duration) : '—';
-      const audioUrl = `${S.twilio.backendUrl}/recordings/${encodeURIComponent(r.sid)}/audio`;
-      return `<div style="padding:9px 14px;border-bottom:1px solid #1e2531">
-        <div style="font-size:12px;font-weight:600">${esc(who)}</div>
-        <div style="font-size:11px;color:var(--ink-faint);margin:2px 0 6px">${esc(when)} · ${esc(dur)}</div>
-        <audio controls preload="none" style="width:100%;height:30px" src="${esc(audioUrl)}"></audio>
-      </div>`;
-    }).join('');
+    RECORDINGS = Array.isArray(data.recordings) ? data.recordings : [];
+    renderHistory();
   } catch(err){
-    listEl.innerHTML = `<div style="padding:10px 14px;color:var(--bad);font-size:11.5px">${esc(err.message)}</div>`;
+    log(`Could not load recordings: ${esc(err.message)}`,'bad');
+    renderHistory();
   }
 }
-$('#recordingsRefreshBtn').onclick = fetchRecordings;
+$('#historyRefreshBtn').onclick = fetchRecordings;
+$('#histSearch').oninput = (e)=>{ histFilter.q = e.target.value; renderHistory(); };
+$('#histDirection').onchange = (e)=>{ histFilter.direction = e.target.value; renderHistory(); };
+$('#histOutcome').onchange = (e)=>{ histFilter.outcome = e.target.value; renderHistory(); };
+$('#histClearBtn').onclick = ()=>{
+  histFilter.q = ''; histFilter.direction = ''; histFilter.outcome = '';
+  $('#histSearch').value = ''; $('#histDirection').value = ''; $('#histOutcome').value = '';
+  renderHistory();
+};
 $('#archiveLoadBtn').onclick = loadArchiveEntry;
 $('#archiveDeleteBtn').onclick = deleteArchiveEntry;
 $('#archiveRefreshBtn').onclick = fetchArchiveList;
@@ -2139,6 +2332,7 @@ document.addEventListener('keydown', e=>{
   }
 });
 /* ---------------- boot ---------------- */
+buildOutcomeFilter();
 syncButtons();
 render();
 log('Prototype loaded. Nothing here dials a real number. Upload a CSV to bring in your own leads, or connect a Twilio backend below to enable live calling.');

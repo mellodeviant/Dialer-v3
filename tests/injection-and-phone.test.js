@@ -109,10 +109,10 @@ test('F-4: a hostile recording label from the backend cannot execute (the B-2 ch
       })),
     });
 
-    d.click('#recordingsRefreshBtn');
+    d.click('#historyRefreshBtn');
     await d.wait(120);
 
-    const list = d.$('#recordingsList');
+    const list = d.$('#historyList');
     assert.ok(list.textContent.includes('onerror'), 'the label must render as text');
     assert.strictEqual(
       list.querySelectorAll('img').length, 0,
@@ -214,6 +214,30 @@ test('F-5: every built-in sample lead is dialable after normalization', async ()
                           .map(function(L){ return L.name + ': ' + L.phone; }))
     `);
     assert.strictEqual(bad, '[]', `these sample numbers would be rejected by Twilio: ${bad}`);
+  } finally { d.close(); }
+});
+
+test('F-5: a built-in lead with display formatting is dialed as clean E.164', async () => {
+  // Caught by the call-history tests: the first version of this guard tested the RAW stored phone,
+  // so it refused to live-dial every sample lead ("+1 555-0142" has spaces and a hyphen). Only
+  // CSV-imported leads pass through normalizePhone, so the dial path has to normalize too.
+  const d = await loadDialer();
+  try {
+    d.evalIn(`
+      S.twilio.liveEnabled = true;
+      S.twilio.device = { connect: function(o){ window.__params = o.params;
+                                                return Promise.resolve({ on:function(){} }); } };
+    `);
+    d.click('#startBtn');
+    assert.strictEqual(d.evalIn('LEADS[S.idx].phone'), '+1 555-0142', 'the lead keeps its readable form');
+
+    d.evalIn('startDial()');
+    await d.wait(60);
+
+    assert.strictEqual(
+      d.win.__params.To, '+15550142',
+      'Twilio must receive digits-only E.164, not the formatted display string'
+    );
   } finally { d.close(); }
 });
 
