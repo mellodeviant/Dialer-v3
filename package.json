@@ -1,0 +1,12 @@
+{
+  "name": "dialer-v3",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Insurance dialer prototype — single-file frontend plus its test harness.",
+  "scripts": {
+    "test": "node --test tests/"
+  },
+  "devDependencies": {
+    "jsdom": "^25.0.1"
+  }
+}

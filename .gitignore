@@ -1,0 +1,2 @@
+# Test harness dependencies (jsdom). Restore with `npm install`.
+node_modules/
